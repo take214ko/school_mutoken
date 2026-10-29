@@ -1,0 +1,49 @@
+{
+  "camera": {
+    "index": 1,
+    "focal_length_px": 1000,
+    "distortion_coefficients": [0, 0, 0, 0, 0]
+  },
+  "marker": {
+    "real_width_m": 0.08
+  },
+  "target": {
+    "x_m": 0.0,
+    "z_m": 0.5,
+    "yaw_deg": 0
+  },
+  "prediction": {
+    "max_seconds": 2.0
+  },
+  "display": {
+    "panel_width": 520,
+    "panel_height": 720,
+    "history_length": 180
+  },
+  "pid": {
+    "x": {
+      "kp": 0.8,
+      "ki": 0.03,
+      "kd": 0.12,
+      "output_limit": 0.4
+    },
+    "z": {
+      "kp": 0.8,
+      "ki": 0.02,
+      "kd": 0.08,
+      "output_limit": 0.4
+    },
+    "yaw": {
+      "kp": 1.5,
+      "ki": 0.02,
+      "kd": 0.15,
+      "output_limit": 1.2
+    }
+  },
+  "mecanum": {
+    "wheel_radius_m": 0.05,
+    "half_length_m": 0.15,
+    "half_width_m": 0.15,
+    "max_wheel_speed_rad_s": 12.0
+  }
+}

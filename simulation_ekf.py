@@ -1,11 +1,22 @@
+# =============================================================================
+# 0.5秒遮蔽（見失い）条件における予測モデル比較シミュレーション
+#
+# このプログラムの全体の流れ：
+#   1. 動くターゲットの「正解軌道（Ground Truth）」を作る
+#   2. カメラの観測ノイズを混ぜつつ、途中3回・各0.5秒間「マーカーが見えない区間」を作る
+#   3. 同じ条件で 3つの方式（予測なし / 線形予測 / EKF）をそれぞれシミュレーションする
+#   4. 推定誤差RMSE・追従誤差RMSE・追従遅れ時間 (Lag) を集計し、CSVとグラフに保存する
+# =============================================================================
+
 import argparse
 import csv
 import math
 from pathlib import Path
 
-import matplotlib.pyplot as plt
+import matplotlib.pyplot as plt  # グラフを作成・画像保存するライブラリ
 import numpy as np
 
+# aruco_tracker.py で作った関数やクラスをそのまま読み込んで再利用する
 from aruco_tracker import (
     MODEL_NAMES,
     PIDController,
@@ -15,23 +26,26 @@ from aruco_tracker import (
     wrap_angle,
 )
 
-DT = 0.05  # 計算周期 50 ms (20 Hz)
+# --- シミュレーション条件の設定 ---
+DT = 0.05  # 計算周期 50 ms (1秒間に20回計算 = 20 Hz)
 DURATION = 12.0  # 実験時間 12 秒
+# マーカーが見えなくなる時間帯のリスト [(開始秒, 終了秒), ...]
 OCCLUSION_WINDOWS = [
     (2.0, 2.5),  # 0.5秒遮蔽（移動中）
     (5.5, 6.0),  # 0.5秒遮蔽（折り返し後・旋回含む）
     (9.0, 9.5),  # 0.5秒遮蔽（復帰移動中）
 ]
 
-# 観測ノイズ（カメラ・solvePnP由来の誤差を模擬）
-NOISE_STD_X = 0.015  # m
-NOISE_STD_Z = 0.015  # m
-NOISE_STD_YAW = math.radians(2.0)  # rad
-RANDOM_SEED = 42
+# 観測ノイズの大きさ（標準偏差）：カメラの測距・角度推定のブレを模擬する
+NOISE_STD_X = 0.015  # 横方向のブレ 1.5 cm
+NOISE_STD_Z = 0.015  # 奥行きのブレ 1.5 cm
+NOISE_STD_YAW = math.radians(2.0)  # 角度のブレ 2 度
+RANDOM_SEED = 42  # 乱数の種（固定すると毎回同じノイズになり、再現性のある比較ができる）
 
 
 def target_world_pose(t, base_distance):
-    """対象の真値軌道 (x, z, yaw)。左右移動＋わずかな前後・角度変化を含む。"""
+    """時刻 t [秒] における対象の「正解位置・向き」を数式で計算する (x, z, yaw, vx, vz)。"""
+    # sin波を使って左右 ±30cm を6秒周期で滑らかに往復する
     x = 0.30 * math.sin(2.0 * math.pi * t / 6.0)
     z = base_distance + 0.08 * math.sin(2.0 * math.pi * t / 12.0)
     vx = 0.30 * (2.0 * math.pi / 6.0) * math.cos(2.0 * math.pi * t / 6.0)
@@ -42,11 +56,14 @@ def target_world_pose(t, base_distance):
 
 
 def is_occluded(t, windows=OCCLUSION_WINDOWS):
+    """時刻 t が遮蔽（見失い）区間の中に入っていれば True、見えていれば False を返す。"""
     return any(start <= t < end for start, end in windows)
 
 
 def estimate_lag_seconds(reference, signal, dt, max_lag_s=1.0):
-    """相互相関により信号の追従遅れ時間[s]を推定する（正の値が遅れ）。"""
+    """相互相関により「ロボットの追従が対象より何秒遅れているか」を推定する（正の値が遅れ）。
+    波（signal）を少しずつ横にずらしながら、元の波（reference）と一番重なるズレ量を探す。
+    """
     ref = np.asarray(reference, dtype=np.float64) - np.mean(reference)
     sig = np.asarray(signal, dtype=np.float64) - np.mean(signal)
     if np.std(ref) < 1e-9 or np.std(sig) < 1e-9:
@@ -69,7 +86,7 @@ def estimate_lag_seconds(reference, signal, dt, max_lag_s=1.0):
 
 
 def compute_recovery_time(times, errors, windows, threshold=0.03):
-    """各遮蔽終了後、誤差が threshold 以下に戻るまでの平均復帰時間[s]。"""
+    """各遮蔽終了後、推定誤差が threshold (3cm) 以下に落ち着くまでの平均復帰時間[秒]。"""
     recovery_times = []
     for _, end_t in windows:
         after_indices = np.where(times >= end_t)[0]
@@ -89,30 +106,32 @@ def simulate_model(model_name, config, noise_sequence):
     mecanum = config["mecanum"]
     base_distance = target["z"]
 
+    # 予測器と3軸のPID制御器を初期化
     predictors = PosePredictors(config["max_prediction_seconds"])
     controllers = [
         PIDController(**config["pid"][axis]) for axis in ("x", "z", "yaw")
     ]
 
-    # 仮想ロボット（メカナム全方向移動）の初期状態
+    # 仮想ロボット（メカナム全方向移動）の初期位置・向き
     robot_x = 0.0
     robot_z = 0.0
     robot_yaw = 0.0
 
     steps = round(DURATION / DT)
-    records = []
+    records = []  # 1ステップごとの記録を辞書にして貯めるリスト
 
     for i in range(steps + 1):
         t = i * DT
         tx, tz, tyaw, _, _ = target_world_pose(t, base_distance)
 
-        # ロボット座標系から見た対象の真の相対位置・姿勢
+        # ワールド座標（部屋基準）から「ロボットから見た相対位置」へ座標変換する
         dx = tx - robot_x
         dz = tz - robot_z
         true_rel_x = math.cos(robot_yaw) * dx - math.sin(robot_yaw) * dz
         true_rel_z = math.sin(robot_yaw) * dx + math.cos(robot_yaw) * dz
         true_rel_yaw = wrap_angle(tyaw - robot_yaw)
 
+        # 遮蔽区間なら観測値なし (None)、見えている区間なら真値にノイズを足して観測値を作る
         occluded = is_occluded(t)
         if occluded:
             measurement = None
@@ -127,6 +146,7 @@ def simulate_model(model_name, config, noise_sequence):
                 dtype=np.float64,
             )
 
+        # 予測器を更新し、今回評価したいモデル (model_name) の推定値を取り出す
         estimates = predictors.update(measurement, t, DT)
         estimate = estimates[model_name]
 
@@ -136,15 +156,17 @@ def simulate_model(model_name, config, noise_sequence):
             command, wheels = calculate_control(
                 control_input, controllers, DT, target, mecanum
             )
+            # 推定値と真値の差（推定誤差）を計算
             est_err_x = estimate[0] - true_rel_x
             est_err_z = estimate[1] - true_rel_z
             est_err_yaw = wrap_angle(estimate[2] - true_rel_yaw)
-            est_err_xz = math.hypot(est_err_x, est_err_z)
+            est_err_xz = math.hypot(est_err_x, est_err_z)  # 三平方の定理で2次元距離を計算
         else:
             command = np.zeros(3, dtype=np.float64)
             wheels = np.zeros(4, dtype=np.float64)
             est_err_x = est_err_z = est_err_yaw = est_err_xz = float("nan")
 
+        # ロボットが目標位置（対象の正面 base_distance 手前）からどれだけズレているか（追従誤差）
         track_err_x = tx - robot_x
         track_err_z = (tz - base_distance) - robot_z
         track_err_xz = math.hypot(track_err_x, track_err_z)
@@ -182,6 +204,7 @@ def simulate_model(model_name, config, noise_sequence):
         if i == steps:
             break
 
+        # 計算した速度指令 [vx, vz, omega] で仮想ロボットを DT 秒だけ進める
         vx, vz, omega = command
         robot_x += (vx * math.cos(robot_yaw) + vz * math.sin(robot_yaw)) * DT
         robot_z += (-vx * math.sin(robot_yaw) + vz * math.cos(robot_yaw)) * DT
@@ -191,6 +214,7 @@ def simulate_model(model_name, config, noise_sequence):
 
 
 def summarize_metrics(records):
+    """シミュレーション結果のリストから、RMSE・最大誤差・ロスト率・遅れ時間などを集計する。"""
     times = np.array([r["time_s"] for r in records])
     occluded = np.array([bool(r["occluded"]) for r in records])
     est_err_xz = np.array([r["est_err_xz_m"] for r in records], dtype=np.float64)
@@ -199,11 +223,13 @@ def summarize_metrics(records):
     target_x = np.array([r["target_x_m"] for r in records], dtype=np.float64)
     robot_x = np.array([r["robot_x_m"] for r in records], dtype=np.float64)
 
+    # ブール配列（True/False）を添字に使うと、条件に合うデータだけ抽出できる（NumPyのマスク機能）
     occ_mask = occluded & np.isfinite(est_err_xz)
     all_mask = np.isfinite(est_err_xz)
 
     return {
         "lost_rate_pct": 100.0 * float(np.mean(occluded)),
+        # RMSE = 二乗して平均をとり、ルートをとった値（誤差の代表的な大きさ）
         "est_rmse_all_m": float(np.sqrt(np.mean(est_err_xz[all_mask] ** 2))),
         "est_rmse_occ_m": float(np.sqrt(np.mean(est_err_xz[occ_mask] ** 2))),
         "est_max_occ_m": float(np.max(est_err_xz[occ_mask])),

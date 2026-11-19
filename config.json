@@ -1,7 +1,7 @@
 {
   "camera": {
-    "index": 1,
-    "focal_length_px": 1000,
+    "index": 0,
+    "focal_length_px": 680,
     "distortion_coefficients": [0, 0, 0, 0, 0]
   },
   "marker": {

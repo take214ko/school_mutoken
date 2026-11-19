@@ -5,7 +5,8 @@
     "distortion_coefficients": [0, 0, 0, 0, 0]
   },
   "marker": {
-    "real_width_m": 0.08
+    "real_width_m": 0.08,
+    "target_id": 0
   },
   "target": {
     "x_m": 0.0,

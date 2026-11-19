@@ -1,3 +1,6 @@
+import argparse
+import csv
+from datetime import datetime
 import json
 import math
 import time
@@ -6,6 +9,26 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+
+
+CSV_HEADER = [
+    "time_s",
+    "status",
+    "obs_x_m",
+    "obs_z_m",
+    "obs_yaw_rad",
+    "ekf_x_m",
+    "ekf_z_m",
+    "ekf_yaw_rad",
+    "model",
+    "cmd_vx_m_s",
+    "cmd_vy_m_s",
+    "cmd_omega_rad_s",
+    "wheel_fl_rad_s",
+    "wheel_fr_rad_s",
+    "wheel_rl_rad_s",
+    "wheel_rr_rad_s",
+]
 
 
 MODEL_NAMES = {
@@ -90,6 +113,12 @@ def load_config(path):
             ),
         }
 
+    marker_target_id = (
+        _require_integer(marker, "target_id", minimum=0)
+        if "target_id" in marker
+        else 0
+    )
+
     return {
         "camera": {
             "index": _require_integer(camera, "index", minimum=0),
@@ -101,6 +130,7 @@ def load_config(path):
         "marker_real_width": _require_number(
             marker, "real_width_m", minimum=0.0, strict_minimum=True
         ),
+        "marker_target_id": marker_target_id,
         "target": {
             "x": _require_number(target, "x_m"),
             "z": _require_number(target, "z_m", minimum=0.0, strict_minimum=True),
@@ -491,8 +521,104 @@ def draw_gauge(canvas, x, y, label, value, limit, unit, color):
     )
 
 
-def main():
-    config_path = Path(__file__).with_name("config.json")
+def find_target_marker(corners, ids, target_id):
+    if ids is None or len(corners) == 0:
+        return None
+    flat_ids = np.asarray(ids).reshape(-1)
+    matching_indices = [
+        index for index, marker_id in enumerate(flat_ids)
+        if int(marker_id) == target_id
+    ]
+    if not matching_indices:
+        return None
+    if len(matching_indices) == 1:
+        return matching_indices[0]
+    areas = [
+        abs(cv2.contourArea(corners[index].reshape(4, 2).astype(np.float32)))
+        for index in matching_indices
+    ]
+    return matching_indices[int(np.argmax(areas))]
+
+
+def is_safety_stop_active(measurement, last_observation_time, now, max_prediction_seconds):
+    if measurement is not None or last_observation_time is None:
+        return False
+    return (now - last_observation_time) >= max_prediction_seconds - 1e-9
+
+
+def format_csv_row(
+    elapsed_time, status, measurement, ekf_estimate, selected_model, command, wheel_speeds
+):
+    obs_values = (
+        [f"{measurement[0]:.6f}", f"{measurement[1]:.6f}", f"{measurement[2]:.6f}"]
+        if measurement is not None
+        else ["", "", ""]
+    )
+    ekf_values = (
+        [f"{ekf_estimate[0]:.6f}", f"{ekf_estimate[1]:.6f}", f"{ekf_estimate[2]:.6f}"]
+        if ekf_estimate is not None
+        else ["", "", ""]
+    )
+    return [
+        f"{elapsed_time:.4f}",
+        status,
+        *obs_values,
+        *ekf_values,
+        selected_model,
+        f"{command[0]:.6f}",
+        f"{command[1]:.6f}",
+        f"{command[2]:.6f}",
+        f"{wheel_speeds[0]:.6f}",
+        f"{wheel_speeds[1]:.6f}",
+        f"{wheel_speeds[2]:.6f}",
+        f"{wheel_speeds[3]:.6f}",
+    ]
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="ArUcoマーカー追跡・PID制御シミュレーション"
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path(__file__).with_name("config.json"),
+        help="設定JSONファイルのパス (既定: config.json)",
+    )
+    parser.add_argument(
+        "--video",
+        type=Path,
+        default=None,
+        help="入力動画ファイルのパス (指定時はカメラの代わりに動画を使用)",
+    )
+    parser.add_argument(
+        "--no-display",
+        action="store_true",
+        help="画面描画・ウィンドウ表示を無効化する (ヘッドレス・ラズパイ負荷軽減用)",
+    )
+    parser.add_argument(
+        "--log",
+        type=Path,
+        default=None,
+        help="CSVログの出力先パス (未指定時は aruco_log_YYYYMMDD_HHMMSS.csv に自動出力)",
+    )
+    parser.add_argument(
+        "--no-log",
+        action="store_true",
+        help="CSVログ出力を無効化する",
+    )
+    parser.add_argument(
+        "--model",
+        choices=tuple(MODEL_NAMES.keys()),
+        default="ekf",
+        help="初期制御モデル (既定: ekf)",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    config_path = args.config
     try:
         config = load_config(config_path)
     except FileNotFoundError:
@@ -512,38 +638,101 @@ def main():
     display_config = config["display"]
     target = config["target"]
     mecanum = config["mecanum"]
-    cap = cv2.VideoCapture(camera_config["index"])
-    if not cap.isOpened():
-        print("エラー: カメラをオープンできませんでした。インデックスを確認してください。")
-        return
+    target_marker_id = config["marker_target_id"]
+    max_prediction_seconds = config["max_prediction_seconds"]
+
+    is_video_mode = args.video is not None
+    if is_video_mode:
+        if not args.video.exists():
+            print(f"エラー: 動画ファイルが見つかりません: {args.video}")
+            return
+        cap = cv2.VideoCapture(str(args.video))
+        if not cap.isOpened():
+            print(f"エラー: 動画ファイルをオープンできませんでした: {args.video}")
+            return
+        raw_fps = cap.get(cv2.CAP_PROP_FPS)
+        video_fps = (
+            raw_fps if raw_fps and math.isfinite(raw_fps) and raw_fps > 0 else 30.0
+        )
+        video_dt = 1.0 / video_fps
+    else:
+        cap = cv2.VideoCapture(camera_config["index"])
+        if not cap.isOpened():
+            print("エラー: カメラをオープンできませんでした。インデックスを確認してください。")
+            return
+        video_dt = None
+
+    log_file = None
+    log_writer = None
+    log_path = None
+    if not args.no_log:
+        if args.log is not None:
+            log_path = args.log
+        else:
+            timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+            log_path = Path(f"aruco_log_{timestamp_str}.csv")
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_file = log_path.open("w", newline="", encoding="utf-8")
+            log_writer = csv.writer(log_file)
+            log_writer.writerow(CSV_HEADER)
+        except OSError as error:
+            print(f"エラー: CSVログファイルを作成できません: {error}")
+            cap.release()
+            return
 
     dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
     parameters = cv2.aruco.DetectorParameters()
     detector = cv2.aruco.ArucoDetector(dictionary, parameters)
-    predictors = PosePredictors(config["max_prediction_seconds"])
-    histories = {
-        name: deque(maxlen=display_config["history_length"])
-        for name in MODEL_NAMES
-    }
+    predictors = PosePredictors(max_prediction_seconds)
+    histories = (
+        {
+            name: deque(maxlen=display_config["history_length"])
+            for name in MODEL_NAMES
+        }
+        if not args.no_display
+        else None
+    )
     controllers = [
         PIDController(**config["pid"]["x"]),
         PIDController(**config["pid"]["z"]),
         PIDController(**config["pid"]["yaw"]),
     ]
-    selected_model = "ekf"
-    previous_frame_time = time.monotonic()
+    selected_model = args.model
+    start_time = time.monotonic()
+    previous_frame_time = start_time
+    frame_index = 0
+    was_safety_stopped = False
 
-    print("ArUco制御シミュレーション開始: 1/2/3で推定方式を選択、qで終了")
+    mode_desc = f"動画入力 ({args.video})" if is_video_mode else f"カメラ {camera_config['index']}"
+    display_desc = "画面描画OFF" if args.no_display else "1/2/3で推定方式を選択、qで終了"
+    print(
+        f"ArUco制御シミュレーション開始 [{mode_desc} / 追跡対象: ID {target_marker_id}]: "
+        f"{display_desc}"
+    )
+    if log_path is not None:
+        print(f"CSVログ出力先: {log_path}")
+
     try:
         while True:
             ret, frame = cap.read()
             if not ret:
-                print("エラー: フレームを取得できませんでした。")
+                if is_video_mode:
+                    print(f"動画ファイルの処理が完了しました ({frame_index} フレーム)。")
+                else:
+                    print("エラー: フレームを取得できませんでした。")
                 break
 
-            now = time.monotonic()
-            dt = float(np.clip(now - previous_frame_time, 1e-3, 0.2))
-            previous_frame_time = now
+            if is_video_mode:
+                now = frame_index * video_dt
+                dt = video_dt
+                elapsed_time = now
+            else:
+                now = time.monotonic()
+                dt = float(np.clip(now - previous_frame_time, 1e-3, 0.2))
+                previous_frame_time = now
+                elapsed_time = now - start_time
+            frame_index += 1
 
             height, width = frame.shape[:2]
             focal_length = camera_config["focal_length_px"]
@@ -558,39 +747,36 @@ def main():
 
             corners, ids, _ = detector.detectMarkers(frame)
             pose = None
-            marker_id = None
-            pose_status = "MARKER NOT DETECTED"
+            pose_status = f"TARGET ID {target_marker_id} NOT DETECTED"
             if ids is not None and len(corners) > 0:
-                cv2.aruco.drawDetectedMarkers(frame, corners, ids)
-                areas = [
-                    abs(cv2.contourArea(corner.reshape(4, 2).astype(np.float32)))
-                    for corner in corners
-                ]
-                marker_index = int(np.argmax(areas))
-                marker_id = int(np.asarray(ids).reshape(-1)[marker_index])
-                pose = estimate_marker_pose(
-                    corners[marker_index],
-                    camera_matrix,
-                    distortion,
-                    config["marker_real_width"],
-                )
-                if pose is not None:
-                    position, yaw, rotation_vector, translation_vector = pose
-                    marker_center = tuple(
-                        np.round(np.mean(corners[marker_index][0], axis=0)).astype(int)
+                if not args.no_display:
+                    cv2.aruco.drawDetectedMarkers(frame, corners, ids)
+                marker_index = find_target_marker(corners, ids, target_marker_id)
+                if marker_index is not None:
+                    pose = estimate_marker_pose(
+                        corners[marker_index],
+                        camera_matrix,
+                        distortion,
+                        config["marker_real_width"],
                     )
-                    cv2.circle(frame, marker_center, 5, (0, 0, 255), -1)
-                    cv2.drawFrameAxes(
-                        frame, camera_matrix, distortion, rotation_vector,
-                        translation_vector, config["marker_real_width"] * 0.5,
-                    )
-                    pose_status = (
-                        f"ID {marker_id} X:{position[0]:+.2f} "
-                        f"Y:{position[1]:+.2f} Z:{position[2]:.2f}m "
-                        f"Yaw:{math.degrees(yaw):+.1f}deg"
-                    )
-                else:
-                    pose_status = f"ID {marker_id} POSE ESTIMATION FAILED"
+                    if pose is not None:
+                        position, yaw, rotation_vector, translation_vector = pose
+                        if not args.no_display:
+                            marker_center = tuple(
+                                np.round(np.mean(corners[marker_index][0], axis=0)).astype(int)
+                            )
+                            cv2.circle(frame, marker_center, 5, (0, 0, 255), -1)
+                            cv2.drawFrameAxes(
+                                frame, camera_matrix, distortion, rotation_vector,
+                                translation_vector, config["marker_real_width"] * 0.5,
+                            )
+                        pose_status = (
+                            f"ID {target_marker_id} X:{position[0]:+.2f} "
+                            f"Y:{position[1]:+.2f} Z:{position[2]:.2f}m "
+                            f"Yaw:{math.degrees(yaw):+.1f}deg"
+                        )
+                    else:
+                        pose_status = f"ID {target_marker_id} POSE ESTIMATION FAILED"
 
             measurement = None
             if pose is not None:
@@ -599,13 +785,67 @@ def main():
                     [position[0], position[2], yaw], dtype=np.float64
                 )
             estimates = predictors.update(measurement, now, dt)
-            for name, estimate in estimates.items():
-                if estimate is not None:
-                    histories[name].append(estimate.copy())
+            if histories is not None:
+                for name, estimate in estimates.items():
+                    if estimate is not None:
+                        histories[name].append(estimate.copy())
 
-            if measurement is None:
+            safety_stop = is_safety_stop_active(
+                measurement,
+                predictors.last_observation_time,
+                now,
+                max_prediction_seconds,
+            )
+
+            estimate = estimates[selected_model]
+            if safety_stop:
+                if not was_safety_stopped:
+                    for controller in controllers:
+                        controller.reset()
+                command = np.zeros(3, dtype=np.float64)
+                wheel_speeds = np.zeros(4, dtype=np.float64)
+                status_label = "SAFETY_STOP"
+            elif estimate is not None:
+                command, wheel_speeds = calculate_control(
+                    estimate, controllers, dt, target, mecanum
+                )
+                status_label = "MEASUREMENT" if measurement is not None else "PREDICTING"
+            else:
+                command = np.zeros(3, dtype=np.float64)
+                wheel_speeds = np.zeros(4, dtype=np.float64)
+                status_label = "WAITING"
+            was_safety_stopped = safety_stop
+
+            if log_writer is not None:
+                log_writer.writerow(
+                    format_csv_row(
+                        elapsed_time,
+                        status_label,
+                        measurement,
+                        estimates["ekf"],
+                        selected_model,
+                        command,
+                        wheel_speeds,
+                    )
+                )
+
+            if args.no_display:
+                continue
+
+            if safety_stop:
+                lost_seconds = now - predictors.last_observation_time
+                status_color = (0, 0, 255)
+                camera_status = (
+                    f"SAFETY STOP (LOST {lost_seconds:.1f}s >= "
+                    f"{max_prediction_seconds:.1f}s)"
+                )
+            elif measurement is None:
                 status_color = (0, 150, 255)
-                camera_status = "OCCLUDED / PREDICTING" if estimates["ekf"] is not None else "WAITING FOR MARKER"
+                camera_status = (
+                    "OCCLUDED / PREDICTING"
+                    if estimates["ekf"] is not None
+                    else "WAITING FOR MARKER"
+                )
             else:
                 status_color = (80, 220, 80)
                 camera_status = "MEASUREMENT"
@@ -616,15 +856,6 @@ def main():
                 f"Control model: {MODEL_NAMES[selected_model]} (display only)",
                 (12, 72), (255, 220, 80), 0.48,
             )
-
-            estimate = estimates[selected_model]
-            if estimate is not None:
-                command, wheel_speeds = calculate_control(
-                    estimate, controllers, dt, target, mecanum
-                )
-            else:
-                command = np.zeros(3, dtype=np.float64)
-                wheel_speeds = np.zeros(4, dtype=np.float64)
 
             panel_width = display_config["panel_width"]
             display_height = max(height, display_config["panel_height"])
@@ -652,7 +883,12 @@ def main():
                 canvas, f"CONTROL INPUT: {MODEL_NAMES[selected_model]}",
                 (panel_x + 14, 378), (255, 220, 80), 0.55,
             )
-            if estimate is None:
+            if safety_stop:
+                draw_text(
+                    canvas, "SAFETY STOP: Wheel speed forced to 0",
+                    (panel_x + 14, 405), (0, 0, 255), 0.48,
+                )
+            elif estimate is None:
                 draw_text(canvas, "Waiting for the first valid pose", (panel_x + 14, 405),
                           (0, 150, 255), 0.48)
             else:
@@ -698,9 +934,15 @@ def main():
                     controller.reset()
             elif key == ord("q"):
                 break
+    except KeyboardInterrupt:
+        print("\n中断されました。")
     finally:
         cap.release()
-        cv2.destroyAllWindows()
+        if not args.no_display:
+            cv2.destroyAllWindows()
+        if log_file is not None:
+            log_file.close()
+            print(f"CSVログを保存しました: {log_path}")
 
 
 if __name__ == "__main__":

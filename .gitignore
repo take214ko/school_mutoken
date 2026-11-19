@@ -10,3 +10,6 @@ __pycache__/
 # 環境変数・秘密情報
 .env
 .env.*
+
+# テスト実行時に自動生成されるArUcoログCSV
+aruco_log_*.csv
